@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cicd-demo
+  namespace: cicd-demo
+spec:
+  type: LoadBalancer   # Azure provisions a public IP -> open http://<EXTERNAL-IP> in a browser
+  selector:
+    app: cicd-demo
+  ports:
+    - port: 80
+      targetPort: 8080

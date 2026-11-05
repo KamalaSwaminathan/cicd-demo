@@ -1,0 +1,134 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:          # PRs run build + test only, never deploy
+    branches: [main]
+  workflow_dispatch:     # manual "Run workflow" button (handy for the demo)
+
+# If you push twice quickly, cancel the older run instead of deploying twice.
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  IMAGE_NAME: cicd-demo
+
+jobs:
+  # ---------------- CI: checkout, compile, test, package ----------------
+  build-test:
+    name: Build & Test (Maven)
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.vars.outputs.sha }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (with Maven dependency cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Compile, run tests, package JAR
+        run: mvn -B clean verify
+
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: JUnit Tests
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+
+      - name: Short commit SHA (used as image tag)
+        id: vars
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JAR for the Docker job
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/app.jar
+          retention-days: 3
+
+  # ---------------- CD part 1: build & push image ----------------
+  docker:
+    name: Build & Push Image
+    needs: build-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tested JAR (no rebuild)
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push (tags = commit SHA + latest)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.ACR_SERVER }}/${{ env.IMAGE_NAME }}:${{ needs.build-test.outputs.sha }}
+            ${{ secrets.ACR_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
+  # ---------------- CD part 2: deploy with Ansible & verify ----------------
+  deploy:
+    name: Deploy to AKS (Ansible)
+    needs: [build-test, docker]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible + Kubernetes collection
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet ansible-core kubernetes
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/venv/bin/ansible-galaxy" collection install kubernetes.core
+
+      - name: Write kubeconfig from secret
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          chmod 600 "$RUNNER_TEMP/kubeconfig"
+
+      - name: Run deployment playbook
+        env:
+          K8S_AUTH_KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          ACR_SERVER: ${{ secrets.ACR_SERVER }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/deploy.yml \
+            -e image=${{ secrets.ACR_SERVER }}/${{ env.IMAGE_NAME }}:${{ needs.build-test.outputs.sha }} \
+            -e app_version=${{ needs.build-test.outputs.sha }}
+
+      - name: Show cluster state (evidence for the report)
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          kubectl get deploy,pods,svc -n cicd-demo -o wide
+          IP=$(kubectl get svc cicd-demo -n cicd-demo -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "App URL: http://$IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image tag: ${{ needs.build-test.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"

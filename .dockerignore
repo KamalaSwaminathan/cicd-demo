@@ -1,0 +1,3 @@
+# Only target/app.jar is needed in the build context. Everything else just slows the upload to the Docker daemon.
+*
+!target/app.jar

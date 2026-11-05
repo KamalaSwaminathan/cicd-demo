@@ -1,0 +1,117 @@
+---
+# Deploys (or updates) the app on the Kubernetes cluster and verifies it.
+# Idempotent: running it twice with the same image changes nothing.
+#
+# Required extra vars:  image (full image ref), app_version (git SHA)
+# Required env vars:    K8S_AUTH_KUBECONFIG, ACR_SERVER, ACR_USERNAME, ACR_PASSWORD
+#
+# Example:
+#   ansible-playbook -i ansible/inventory.ini ansible/deploy.yml \
+#     -e image=myacr.azurecr.io/cicd-demo:abc1234 -e app_version=abc1234
+
+- name: Deploy cicd-demo to Kubernetes
+  hosts: k8s_control
+  gather_facts: false
+  vars:
+    namespace: cicd-demo
+    manifests_dir: "{{ playbook_dir }}/../k8s"
+    acr_server: "{{ lookup('env', 'ACR_SERVER') }}"
+    acr_username: "{{ lookup('env', 'ACR_USERNAME') }}"
+    acr_password: "{{ lookup('env', 'ACR_PASSWORD') }}"
+
+  tasks:
+    - name: Check required variables
+      ansible.builtin.assert:
+        that:
+          - image is defined and image | length > 0
+          - app_version is defined and app_version | length > 0
+          - acr_server | length > 0
+        fail_msg: "Pass -e image=... -e app_version=... and set ACR_SERVER/ACR_USERNAME/ACR_PASSWORD"
+
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ manifests_dir }}/namespace.yaml"
+
+    - name: Create/refresh the registry pull secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: kubernetes.io/dockerconfigjson
+          metadata:
+            name: acr-pull-secret
+            namespace: "{{ namespace }}"
+          data:
+            .dockerconfigjson: >-
+              {{ {'auths': {acr_server: {'username': acr_username, 'password': acr_password,
+                  'auth': (acr_username ~ ':' ~ acr_password) | b64encode}}} | to_json | b64encode }}
+      no_log: true   # never print registry credentials in pipeline logs
+
+    - name: Apply Deployment with the new image tag and wait for the rollout
+      kubernetes.core.k8s:
+        state: present
+        definition: >-
+          {{ lookup('file', manifests_dir ~ '/deployment.yaml')
+             | replace('IMAGE_PLACEHOLDER', image)
+             | replace('VERSION_PLACEHOLDER', '"' ~ app_version ~ '"')
+             | from_yaml }}
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+    - name: Apply Service
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ manifests_dir }}/service.yaml"
+
+    - name: Wait for the LoadBalancer to get a public IP
+      kubernetes.core.k8s_info:
+        kind: Service
+        name: cicd-demo
+        namespace: "{{ namespace }}"
+      register: svc
+      until: svc.resources[0].status.loadBalancer.ingress is defined
+      retries: 30
+      delay: 10
+
+    - name: Wait until every pod runs the new version (old pods terminated)
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ namespace }}"
+        label_selectors: ["app=cicd-demo"]
+      register: pods
+      until: >-
+        pods.resources | length > 0 and
+        (pods.resources | map(attribute='spec.containers') | map('first')
+          | map(attribute='image') | unique | list) == [image]
+      retries: 30
+      delay: 5
+
+    - name: Smoke test - health endpoint
+      ansible.builtin.uri:
+        url: "http://{{ svc.resources[0].status.loadBalancer.ingress[0].ip }}/actuator/health"
+        return_content: true
+      register: health
+      until: health.status == 200 and health.json.status == 'UP'
+      retries: 20
+      delay: 6
+
+    - name: Smoke test - the live app reports the version we just deployed
+      ansible.builtin.uri:
+        url: "http://{{ svc.resources[0].status.loadBalancer.ingress[0].ip }}/api/info"
+        return_content: true
+      register: info
+      until: info.json.version == app_version
+      retries: 10
+      delay: 5
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Deployed {{ image }}"
+          - "Live at http://{{ svc.resources[0].status.loadBalancer.ingress[0].ip }}"
+          - "App says: {{ info.json.message }} (version {{ info.json.version }})"

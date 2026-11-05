@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cicd-demo
+  namespace: cicd-demo
+  labels:
+    app: cicd-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cicd-demo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never drop below 2 serving pods during an update = zero downtime
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: cicd-demo
+    spec:
+      imagePullSecrets:
+        - name: acr-pull-secret     # created by the Ansible playbook
+      containers:
+        - name: cicd-demo
+          image: IMAGE_PLACEHOLDER  # replaced by Ansible with <registry>/cicd-demo:<git-sha>
+          ports:
+            - containerPort: 8080
+          env:
+            - name: APP_VERSION
+              value: VERSION_PLACEHOLDER
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:           # only send traffic once the app is actually ready
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          livenessProbe:            # restart the container if it hangs
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 40
+            periodSeconds: 10
