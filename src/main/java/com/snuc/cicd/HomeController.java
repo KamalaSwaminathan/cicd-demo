@@ -12,7 +12,7 @@ import org.springframework.web.bind.annotation.RestController;
 public class HomeController {
 
     // CHANGE THIS LINE for the redeployment demo (e.g. v1 -> v2), commit, push, watch it go live.
-    static final String MESSAGE = "Welcome to the CI/CD Demo - v1";
+    static final String MESSAGE = "Welcome to the CI/CD Demo - v2";
 
     private final GreetingService greetingService;
 
